@@ -5,5 +5,8 @@ edition = "2024"
 
 [dependencies]
 actix-web = "4"
+chrono = "0.4.45"
+futures = "0.3.34"
+jsonwebtoken = "11.1.0"
 serde = { version = "1.0.229", features = ["derive"] }
 web = "0.2.12"

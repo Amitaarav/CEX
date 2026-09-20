@@ -1,124 +1,54 @@
-use actix_web::{App, HttpServer, HttpResponse, Responder, post, web::{self,Json}};
-use std::{collections::HashMap, future, sync::Mutex};
-use serde:: {Serialize, Deserialize};
+use std::{collections::HashMap, os::unix::thread, sync::{Mutex, mpsc::{self, Sender}}, thread::spawn};
 
-#[derive(Serialize, Deserialize)]
-struct SignupInput {
-    pub username: String,
-    pub password: String
-}
+use actix_web::{App, HttpServer, web::{self}};
 
-#[derive(Serialize, Deserialize)]
-struct SignupResponse {
-    message: String
-}
+use crate::{BalanceMessage::{GetBalance, Onramp}, routes::user::{balance, deposit, onramp, sign_in, sign_up}, types::user::User};
 
-#[post("/signup")]
-async fn sign_up(body: Json<SignupInput>, app_state: web::Data<AppState>) -> impl Responder {
-    println!("{}", body.username);
-    println!("{}", body.password);
-    // println!("{}", app_state.users.len());
+pub mod types;
+pub mod routes;
+pub mod middleware;
 
-    let mut users = app_state.users.lock().unwrap();
-
-    let mut user_index = app_state.user_index.lock().unwrap();
-
-    let user_found = users.iter().find(|u | u.username == body.username);
-
-    if user_found.is_none(){
-            *user_index = *user_index + 1;
-            users.push(User {
-                id: *user_index,
-                username: body.username.clone(),
-                password: body.password.clone(),
-                balance: 0
-            });
-
-            println!("{}", users.len());
-            drop(users);
-
-            HttpResponse::Ok().json(
-                SignupResponse{
-                    message: String::from("Signup successfully")
-                }
-            )
-    }else{
-        HttpResponse::Unauthorized().json(SignupResponse{
-            message: String::from("User already exists")
-        })
-    }
-}
-
-struct User {
-    id: u32,
-    username: String,
-    password: String,
-    balance: u32,
-}
-
-enum BalanceMessage{
+enum BalanceMessage {
     Onramp(u32, u32),
-    GetBalance(u32, future::channel::oneshot::Sender<u32>)
+    GetBalance(u32, futures::channel::oneshot::Sender<u32>)
 }
+
 struct AppState {
-    users: Mutex<Vec<User>>,
     user_index: Mutex<u32>,
+    users: Mutex<Vec<User>>,
     stock_balances: Mutex<HashMap<u32, HashMap<String, u32>>>,
     balances_tx: Sender<BalanceMessage>
-
 }
 
-#[derive(Deserialize)]
-struct SigninInput {
-    pub username: String,
-    pub password: String
-}
-
-#[derive(Serialize)]
-struct SigninResponse {
-    message: String
-}
-
-#[post("/signin")]
-async fn sign_in(body: Json<SigninInput>, app_state: web::Data<AppState>) -> impl Responder {
-    let users = app_state.users.lock().unwrap();
-
-    let user_found = users.iter().find(|user | user.username == body.username);
-
-    match user_found {
-        Some(user) => {
-            if user.password == body.password {
-                HttpResponse::Ok().json( SigninResponse{
-                    message: String::from("Signin successfull")
-                })
-            }else{
-                HttpResponse::Unauthorized().json( SigninResponse{
-                    message: String::from("Invalud username or password")
-                })
-            }
-        }
-
-        None => {
-            HttpResponse::Unauthorized().json( SigninResponse{
-                message: String::from("Invalid username or password")
-            })
-        }
-    }
-
-
-}
-
-// balance
-
-// onramp
-
-// deposit
 
 #[actix_web::main]
-async fn main() -> std::io::Result<()>{
-    let app_state = web::Data::new(AppState{
+async fn main() -> std::io::Result<()> {
+    let (tx, rx) = mpsc::channel(); // mpsc: multiple produces, single
+
+    let app_state = web::Data::new(AppState {
+        user_index: Mutex::new(0),
         users: Mutex::new(vec![]),
-        user_index: Mutex::new(0)
+        stock_balances: Mutex::new(HashMap::new()),
+        balances_tx: tx
+    });
+
+
+    spawn(move || {
+        let mut balances: HashMap<u32, u32> = HashMap::new();
+
+        while let message = rx.recv().unwrap() {
+            match message {
+                Onramp(user_id, amount) => {
+                    let existing_amount = balances.get(&user_id).unwrap_or(&0);
+                    balances.insert(user_id, amount + existing_amount);
+                }
+                GetBalance(user_id, tx) => {
+                    let user_balance = balances.get(&user_id).unwrap_or(&0);
+                    tx.send(*user_balance);
+                }
+            }
+        }
+        
     });
 
     HttpServer::new(move || {
@@ -126,6 +56,9 @@ async fn main() -> std::io::Result<()>{
             .app_data(app_state.clone())
             .service(sign_up)
             .service(sign_in)
+            .service(balance)
+            .service(onramp)
+            .service(deposit)
     })
     .bind(("127.0.0.1", 3001))?
     .run()
