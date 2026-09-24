@@ -1,15 +1,28 @@
 import { Router } from "express";
 import jwt from "jsonwebtoken"
 import type { SignupResponse, DepositRequest, OnRampRequest, User, Claims } from "../types/user";
-import { authMiddleware, type AuthRequest } from "../middleware";
+import { authMiddleware, type AuthRequest, JWT_SECRET } from "../middleware";
 
 export const router = Router();
 
 let userIndex = 0;
 const users: User[] = [];
 
-const usdBalances: Map<number, { available: number, locked: number }> = new Map();
-const stockBalances: Map<number, Map<String, { available: number, locked: number }>> = new Map();
+const usdBalances: Map<number, number> = new Map();
+const stockBalances: Map<number, Map<String, number>> = new Map(); 
+/**
+ * {
+ * 1: {
+ *  SOL: 10,
+ *  ETH: 20
+ *  },
+ * 2: {
+ *  SOL: 5,
+ *  ETH: 25
+ * }
+ * 
+ * }
+ */
 
 router.post("/signup", (req, res) => {
     const { username, password} = req.body;
@@ -25,12 +38,15 @@ router.post("/signup", (req, res) => {
         });
     }
 
+    usdBalances.set(userIndex, 0);
+    stockBalances.set(userIndex, new Map())
+
     res.json({
         message: "Successfully signup"
     } satisfies SignupResponse)
 })
 
-router.post("/sigin", (req, res) => {
+router.post("/signin", (req, res) => {
     const {username, password} = req.body;
 
     const userExist = users.find(user => user.username === username && user.password === password);
@@ -48,7 +64,7 @@ router.post("/sigin", (req, res) => {
         exp: Math.floor(Date.now() / 1000) + 24 * 60 * 60
     }
 
-    const token = jwt.sign(claims, "JWT_SECRET");
+    const token = jwt.sign(claims, JWT_SECRET);
 
     res.json({
         token
@@ -57,23 +73,16 @@ router.post("/sigin", (req, res) => {
 
 router.get("/balance", authMiddleware, (req: AuthRequest, res) => {
     const userId = req.userId!;
-    const balance = stockBalances.get(userId) ?? new Map();
-
-    let stock_balance = Object.fromEntries(balance);
 
     res.json({
-        usdBalance: usdBalances.get(userId)?.available,
-        stockBalances: stock_balance
+        usdBalance: usdBalances.get(userId) ?? 0,
+        stockBalances: stockBalances.get(userId) ?? {}
     })
 })
 
 router.post("/onramp", authMiddleware, (req: AuthRequest, res) => {
     const userId = req.userId!;
     const body = req.body as OnRampRequest;
-    usdBalances.set(userId, {
-        locked: usdBalances.get(userId)?.locked!,
-        available: usdBalances.get(userId)?.available! + body.qty,
-    })
 
     res.sendStatus(200)
 })
@@ -85,11 +94,6 @@ router.post("/deposite/:asset_symbol", authMiddleware, (req: AuthRequest, res)=>
 
     const balances = stockBalances.get(userId)!;
     const existingBalance = balances.get(symbol);
-
-    balances.set(symbol, {
-        locked: existingBalance?.locked || 0,
-        available: (existingBalance?.available || 0) + body.qty
-    })
 
     res.json({
         message: "Successfully deposited"

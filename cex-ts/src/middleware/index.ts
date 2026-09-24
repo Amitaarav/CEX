@@ -21,7 +21,8 @@ export function authMiddleware(req: AuthRequest, res: Response, next: NextFuncti
 
     try {
         const claims = jwt.verify(token, JWT_SECRET) as unknown as Claims;
-        req.userId = claims.sub
+        req.userId = claims.sub;
+        next()
     } catch (error) {
         res.status(400).json({
             message: "Invalid or missing token"
