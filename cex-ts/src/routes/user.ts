@@ -38,8 +38,7 @@ router.post("/signup", (req, res) => {
         });
     }
 
-    usdBalances.set(userIndex, 0);
-    stockBalances.set(userIndex, new Map())
+    usdBalances.set(userIndex, 0)
 
     res.json({
         message: "Successfully signup"
@@ -57,7 +56,7 @@ router.post("/signin", (req, res) => {
         } satisfies SignupResponse);
 
         return;
-    }4
+    }
 
     const claims: Claims = {
         sub: userExist.id,
@@ -84,7 +83,12 @@ router.post("/onramp", authMiddleware, (req: AuthRequest, res) => {
     const userId = req.userId!;
     const body = req.body as OnRampRequest;
 
-    res.sendStatus(200)
+    const currentBalance = usdBalances.get(userId) ?? 0;
+
+    usdBalances.set(userId, currentBalance + body.qty);
+    res.status(200).json({
+        message: "Successfully onramp"
+    })
 })
 
 router.post("/deposite/:asset_symbol", authMiddleware, (req: AuthRequest, res)=>{
@@ -94,6 +98,11 @@ router.post("/deposite/:asset_symbol", authMiddleware, (req: AuthRequest, res)=>
 
     const balances = stockBalances.get(userId)!;
     const existingBalance = balances.get(symbol);
+
+    // balances.set(symbol, {
+    //     locked: existingBalance?.locked || 0,
+    //     available: (existingBalance?.available || 0) + body.qty
+    // })
 
     res.json({
         message: "Successfully deposited"

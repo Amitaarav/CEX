@@ -53,3 +53,31 @@ test("balance works as expected",async () => {
     expect(balanceResponse.data.usdBalance).toBe(0);
     expect(balanceResponse.data.stockBalances).toEqual({});
 })
+
+test("onramp works as expected",async () => {
+    const username = "amit" + Math.random();
+
+    await axios.post(`${BACKEND_URL}/signup`, {
+        username: username,
+        password: "123123"
+    });
+
+    const response = await axios.post(`${BACKEND_URL}/signin`, {
+        username: username,
+        password: "123123"
+    });
+
+    const token = response.data.token;
+
+    const onrampResponse = await axios.post(`${BACKEND_URL}/onramp`,
+        {
+            qty: 100
+        },
+        {
+        headers: {
+            Authorization: `Bearer ${token}`
+        }
+    })
+
+    expect(onrampResponse.status).toBe(200);
+})
