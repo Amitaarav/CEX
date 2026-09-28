@@ -1,8 +1,8 @@
-use std::{collections::HashMap, os::unix::thread, sync::{Mutex, mpsc::{self, Sender}}, thread::spawn};
+use std::{collections::HashMap, sync::{Mutex, mpsc::{self, Sender}}, thread::spawn};
 
 use actix_web::{App, HttpServer, web::{self}};
 
-use crate::{BalanceMessage::{GetBalance, Onramp}, routes::user::{balance, deposit, onramp, sign_in, sign_up}, types::user::User};
+use crate::{BalanceMessage::{GetBalance, Onramp}, routes::user::{balance, onramp, sign_in, sign_up}, types::user::User};
 
 pub mod types;
 pub mod routes;
@@ -23,6 +23,7 @@ struct AppState {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+
     let (tx, rx) = mpsc::channel(); // mpsc: multiple produces, single
 
     let app_state = web::Data::new(AppState {
@@ -36,15 +37,19 @@ async fn main() -> std::io::Result<()> {
     spawn(move || {
         let mut balances: HashMap<u32, u32> = HashMap::new();
 
-        while let message = rx.recv().unwrap() {
+        while let Ok(message) = rx.recv(){
             match message {
                 Onramp(user_id, amount) => {
                     let existing_amount = balances.get(&user_id).unwrap_or(&0);
-                    balances.insert(user_id, amount + existing_amount);
+                    balances.insert(
+                        user_id, 
+                        amount + existing_amount
+                    );
                 }
+
                 GetBalance(user_id, tx) => {
                     let user_balance = balances.get(&user_id).unwrap_or(&0);
-                    tx.send(*user_balance);
+                    let _ = tx.send(*user_balance);
                 }
             }
         }
@@ -58,7 +63,6 @@ async fn main() -> std::io::Result<()> {
             .service(sign_in)
             .service(balance)
             .service(onramp)
-            .service(deposit)
     })
     .bind(("127.0.0.1", 3001))?
     .run()

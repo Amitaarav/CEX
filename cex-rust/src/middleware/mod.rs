@@ -1,7 +1,9 @@
-use actix_web::{FromRequest, HttpRequest, HttpResponse, ResponseError, dev::Payload, error::error};
+use actix_web::{FromRequest, HttpRequest, HttpResponse, ResponseError, dev::Payload, error::Error};
 use jsonwebtoken::{DecodingKey, Validation, decode};
 use std::future::{Ready, ready};
 use std::fmt;
+
+// use serde_json::{Result};
 
 use crate::types::user::Claims;
 
@@ -24,11 +26,14 @@ impl ResponseError for AuthError {
     }
 }
 
+pub struct AuthUser(pub u32);
+
 impl FromRequest for AuthUser {
     type Error = Error;
     type Future = Ready<Result<Self, Self::Error>>;
 
     fn from_request(req: &HttpRequest, _payload: &mut Payload) -> Self::Future{
+        println!("Hi from middleware 1");
         let token = req
             .headers()
             .get("Authorization")

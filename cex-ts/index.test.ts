@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import axios from "axios";
 
-const BACKEND_URL = process.env.BACKEND_URL;
+const BACKEND_URL = process.env.RUST_BACKEND_URL;
 
 test("signup works as expected", async () => {
     const username = "amit";

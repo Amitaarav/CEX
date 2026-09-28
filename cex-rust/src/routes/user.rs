@@ -2,8 +2,10 @@ use std::{collections::HashMap};
 use actix_web::{HttpResponse, Responder, get, post, web::{self, Json}};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use chrono::{Duration, Utc};
-use crate::{AppState, BalanceMessage::Onramp, middlware::AuthUser, types::user::{BalanceResponse, Claims, DepositeResponse, OnRampRequest, SigninInput, SigninResponse, SignupResponse, SinginResponse, User}};
+use crate::{AppState, BalanceMessage::Onramp, middleware::AuthUser, types::user::{BalanceResponse, Claims, DepositeRequest, DepositResponse, OnRampRequest, SigninInput, SigninResponse, SignupResponse, User}};
 use crate::types::user::SignupInput;
+use futures::channel::oneshot;
+
 #[post("/signup")]
 async fn sign_up(body: Json<SignupInput>, app_state: web::Data<AppState>) -> impl Responder{
     let mut users = app_state.users.lock().unwrap();
@@ -19,13 +21,13 @@ async fn sign_up(body: Json<SignupInput>, app_state: web::Data<AppState>) -> imp
             password: body.password.clone()
         });
 
-        app_state.balances_tx.send(Onramp(user_index.clone(),0));
+        let _ = app_state.balances_tx.send(Onramp(user_index.clone(),0));
 
         let mut stock_balances = app_state.stock_balances.lock().unwrap();
         stock_balances.insert(user_index.clone(), HashMap::new());
 
         HttpResponse::Ok().json(SignupResponse{
-            message: String::from("Successfully signed up")
+            message: String::from("Successfully signup")
         })
     } else {
         HttpResponse::Unauthorized().json(SignupResponse{
@@ -36,7 +38,7 @@ async fn sign_up(body: Json<SignupInput>, app_state: web::Data<AppState>) -> imp
 
 #[post("/signin")]
 pub async fn sign_in(app_state: web::Data<AppState>, body: Json<SigninInput>) -> impl Responder {
-    let mut users = app_state.users.lock().unwrap();
+    let users = app_state.users.lock().unwrap();
     let user_found = users.iter().find(|u| u.username == body.username && u.password == body.password);
 
     if user_found.is_none() {
@@ -65,15 +67,64 @@ pub async fn sign_in(app_state: web::Data<AppState>, body: Json<SigninInput>) ->
 }
 #[get("/balance")]
 pub async fn balance(app_state: web::Data<AppState>, user: AuthUser) -> impl Responder{
+
     let user_id = user.0;
-    println!("{}", user_id);
-    HttpResponse::Ok()
+
+    let (tx, rx) = oneshot::channel::<u32>();
+    let _ = app_state.balances_tx.send(crate::BalanceMessage::GetBalance(user_id, tx));
+
+    // let usd_balance = app_state.usd_balances.lock().unwrap().get(&user_id).unwrap_or(&0).clone();
+    
+    let usd_balance = rx.await.unwrap();
+    let stock_balances = app_state.stock_balances.lock().unwrap().get(&user_id).unwrap_or(&HashMap::new()).clone();
+
+    HttpResponse::Ok().json( BalanceResponse {
+        usd_balance,
+        stock_balances
+    })
 }
 
 #[post("/onramp")]
-pub async fn onramp(user: AuthUser, body: Json<OnRampRequest>) -> impl Responder {
+pub async fn onramp(app_state: web::Data<AppState>, user: AuthUser, body: Json<OnRampRequest>) -> impl Responder {
     let user_id = user.0;
-    println!("{}", user_id);
-    println!("{}", body.qty);
+
+    let _ = app_state.balances_tx.send(crate::BalanceMessage::Onramp(user_id, body.qty));
+    // let mut balances = app_state.usd_balances.lock().unwrap();
+
+    // let existing_balance = balances.get(&user_id).unwrap_or(&0).clone();
+
+    // balances.insert(user_id, existing_balance + body.qty);
+
     HttpResponse::Ok()
 }
+
+#[post("/deposit/{asset_symbol}/{user_id}")]
+pub async fn deposit(app_state: web::Data<AppState>, user: AuthUser, symbol: web::Path<String>, body: Json<DepositeRequest>)-> impl Responder {
+    let user_id = user.0;
+    
+    let symbol = symbol.into_inner();
+
+    let mut stock_balances = app_state.stock_balances.lock().unwrap();
+
+    let user_balances = stock_balances.entry(user_id).or_insert_with(HashMap::new);
+
+    let existing_balance = user_balances.get(&symbol).unwrap_or(&0).clone();
+
+    user_balances.insert(symbol, existing_balance + body.qty);
+
+    HttpResponse::Ok().json( DepositResponse {
+        message: String::from("Successfully deposited")
+    })
+}
+
+// this endipoints is hit by traders
+
+// these both need to maintain a orderbook with a data structure
+// #[post("/order")]
+// pub async fn order(){
+//     HttpResponse::Ok()
+// }
+// #[post("/cancel")]
+// pub async fn cancel(){
+//     HttpResponse::Ok()
+// }
