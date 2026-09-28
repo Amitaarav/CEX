@@ -52,7 +52,7 @@ pub struct OnRampResponse {
 
 
 #[derive(Serialize, Deserialize)]
-pub struct DespositResponse {
+pub struct DepositResponse {
     pub message: String
 }
 
