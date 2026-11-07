@@ -12,8 +12,8 @@ This is a learning project. I'm building it in small, tested steps to understand
 
 | Endpoint | Auth | Status | Notes |
 | --- | --- | --- | --- |
-| `POST /signup` | none | Working | Duplicate usernames rejected |
-| `POST /signin` | none | Working | Returns a 24h JWT |
+| `POST /signup` | none | Working | Password hashed with bcrypt; duplicate usernames rejected |
+| `POST /signin` | none | Working | Verified with bcrypt; returns a 24h JWT |
 | `GET /balance` | JWT | Working | USD and stock balances from dedicated worker threads via mpsc + oneshot |
 | `POST /onramp` | JWT | Working | Fire-and-forget message to the balance worker |
 | `POST /deposit/{asset_symbol}` | JWT | Working | Fire-and-forget message to the stock balance worker |
@@ -27,11 +27,12 @@ This is a learning project. I'm building it in small, tested steps to understand
 | --- | --- |
 | Rust (edition 2024) | Ownership and type system make shared-state bugs visible at compile time |
 | Actix Web 4 | HTTP server; requests are handled concurrently on a thread pool |
+| bcrypt | Password hashing with adaptive work factor and salting |
 | Serde / serde_json | Request and response (de)serialization; `camelCase` for API output |
 | jsonwebtoken + chrono | Signing JWTs and computing expiry |
 | `std::sync::Mutex` | Guarding shared user state (`users`, `user_index`) |
 | `std::sync::mpsc` + `futures::channel::oneshot` | Message passing to the USD and stock balance workers and getting replies back |
-| Bun + Axios | Integration tests against the running server over real HTTP |
+| Cargo test + Bun / Axios | Unit tests via `cargo test` and integration tests against the running server |
 
 ---
 
@@ -39,7 +40,7 @@ This is a learning project. I'm building it in small, tested steps to understand
 
 ```mermaid
 flowchart TD
-    Client["Client / Bun tests"] --> Actix["Actix Web handlers"]
+    Client["Client / Tests"] --> Actix["Actix Web handlers"]
     Actix -->|"AuthUser extractor validates JWT"| Handlers["signup / signin / balance / onramp / deposit"]
     Handlers -->|"Mutex"| State["AppState: users, user_index"]
     Handlers -->|"mpsc: Onramp, GetBalance"| BalanceWorker["USD Balance worker thread"]
@@ -56,7 +57,7 @@ Code layout:
 src/
   main.rs              AppState, BalanceMessage & StockBalanceMessage enums, worker threads, server setup
   middleware.rs        AuthUser extractor (JWT validation), AuthError
-  routes/user.rs       signup, signin, balance, onramp, deposit handlers
+  routes/user.rs       signup, signin, balance, onramp, deposit handlers, tests
   types/user.rs        User, request/response structs, JWT Claims
 ```
 
@@ -66,7 +67,7 @@ src/
 
 ### 1. Actor-style (message passing) for balances
 
-Both USD and stock balances are owned by dedicated worker threads. Handlers cannot mutate the maps directly:
+Both USD and stock balances are owned by dedicated worker threads. Handlers cannot mutate the balance maps directly:
 
 - **USD Balances**: Handlers send `BalanceMessage` (`Onramp` or `GetBalance`).
 - **Stock Balances**: Handlers send `StockBalanceMessage` (`Deposit` or `GetStockBalance`).
@@ -83,7 +84,7 @@ pub enum StockBalanceMessage {
 }
 ```
 
-The workers process messages sequentially, eliminating data races on the balance maps without requiring locks around balance logic.
+The workers process messages sequentially, eliminating data races on balance maps without requiring locks around balance logic.
 
 - **Lock-based (`Mutex`)**: Reserved only for `users` and `user_index` in `AppState`.
 
@@ -99,7 +100,15 @@ let usd_balance = rx.await.unwrap();
 
 Because the worker is single-threaded and the channel is FIFO, an `Onramp` sent before a `GetBalance` is always applied before it. So a client that calls `/onramp` and then `/balance` sees its own write, even though `/onramp` returns without waiting for the worker.
 
-### 3. Authentication as an extractor
+### 3. Password security with bcrypt
+
+Passwords are never stored in plaintext:
+
+- On `/signup`, `bcrypt::hash(&body.password, DEFAULT_COST)` hashes the password before saving the user in state.
+- On `/signin`, `bcrypt::verify(&body.password, &user.password)` compares the password safely.
+- Unknown usernames and invalid passwords both yield `401 Unauthorized ("Incorrect credentials")` to prevent user enumeration attacks.
+
+### 4. Authentication as an extractor
 
 `AuthUser` implements Actix's `FromRequest`. Any handler that declares `user: AuthUser` as a parameter is automatically protected: the extractor reads `Authorization: Bearer <token>`, decodes the JWT, and yields the user ID from the `sub` claim. If validation fails, the handler never runs.
 
@@ -107,15 +116,9 @@ Two consequences I like:
 - The user identity **always comes from the token**, never from the URL or body, so a client can't act as another user by changing a parameter.
 - Auth is declared in the handler signature, so it can't be forgotten by omission in a router config.
 
-(The file is named `middleware.rs`, but it's an extractor, not middleware, so it only runs where a handler asks for it.)
-
-### 4. Money as integers
+### 5. Money as integers
 
 Balances and quantities are integers (`u32`), never floats, to avoid rounding errors. The plan is to move to a wider type and define explicit units (for example, cents for USD, smallest units for assets).
-
-### 5. Initialization on signup
-
-`/signup` sends `Onramp(id, 0)` to the worker and inserts an empty asset map, so every user has an entry in both stores from creation.
 
 ---
 
@@ -125,30 +128,28 @@ Found while reviewing the code, roughly in priority order.
 
 **Correctness**
 
-1. **`/deposit` doesn't work yet.** It is not imported or registered in `main.rs`. Its route is `/deposit/{asset_symbol}/{user_id}` but the handler extracts a single `Path<String>`, so extraction fails with two path segments. The `{user_id}` segment should be dropped, since identity comes from the JWT. That matches the design and the API shape I documented.
-2. **Overflow can kill the worker.** `amount + existing_amount` on `u32` panics in debug builds and wraps silently in release. If the worker thread panics, every later `GetBalance` fails and `rx.await.unwrap()` panics in the handler. Fix: `checked_add`, a wider type, and returning an error instead of unwrapping.
-3. **Onramp is fire-and-forget.** The handler returns `200` without confirmation, and send errors are ignored (`let _ =`). If the worker is gone, the client is told it succeeded.
-4. **Two sources of truth for balances.** USD lives in the worker and assets live in a mutex map. That works for independent deposits, but a trade must change both atomically (debit USD, credit BTC, and the reverse), which two separate stores can't guarantee.
+1. **Overflow can kill the worker.** `amount + existing_amount` on `u32` panics in debug builds and wraps silently in release. If the worker thread panics, every later `GetBalance` fails and `rx.await.unwrap()` panics in the handler. Fix: `checked_add`, a wider type, and returning an error instead of unwrapping.
+2. **Onramp & deposit are fire-and-forget.** Handlers return `200` without confirmation, and send errors are ignored (`let _ =`). If the worker thread crashes, clients are told the operation succeeded.
+3. **Two balance actors vs. matching engine atomicity.** USD and stock balances live in separate worker threads. While lock-free and decoupled for isolated deposits, trade execution requires debiting one asset and crediting another atomically, which motivates unifying both under a single matching engine actor.
 
 **Security** (must be fixed before anything real)
 
-5. Passwords are stored and compared in plaintext. Use `argon2` or `bcrypt`.
-6. The JWT secret is hardcoded in two places (`"secret"`), and the `JWT_SECRET` constant in `middleware.rs` is unused. Load one secret from the environment.
-7. The `Bearer ` prefix is optional (`trim_start_matches`), so a bare token is accepted.
+4. The JWT secret is hardcoded in two places (`"secret"`), and the `JWT_SECRET` constant in `middleware.rs` is unused. Load one secret from the environment.
+5. The `Bearer ` prefix is optional (`trim_start_matches`), so a bare token is accepted.
 
 **API quality**
 
-8. Status codes: duplicate signup returns `401` (should be `409`); a missing or invalid token returns `400` (should be `401`).
-9. `println!("Hi from middleware 1")` is leftover debug output.
-10. `users` is a `Vec` searched linearly. A `HashMap` keyed by username would be O(1).
-11. Asset symbols are case-sensitive (`BTC` and `btc` are different assets). Normalize them.
-12. Cargo.toml lists a crate named `web`, which looks like an accidental auto-import. Remove it unless intentional.
+6. Status codes: duplicate signup returns `401` (should be `409`); a missing or invalid token returns `400` (should be `401`).
+7. `println!("Hi from middleware 1")` is leftover debug output.
+8. `users` is a `Vec` searched linearly. A `HashMap` keyed by username would be O(1).
+9. Asset symbols are case-sensitive (`BTC` and `btc` are different assets). Normalize them.
+10. Cargo.toml lists a crate named `web`, which looks like an accidental auto-import. Remove it unless intentional.
 
 ---
 
 ## Design direction: one engine thread
 
-The balance worker is the seed of the matching engine. The matching engine needs to change USD balances, asset balances, and the order book together, and a single owning thread gives that atomicity without locks. The plan:
+The balance workers are the seed of the matching engine. The matching engine needs to change USD balances, asset balances, and the order book together, and a single owning thread gives that atomicity without locks. The plan:
 
 ```rust
 enum EngineMessage {
@@ -169,8 +170,10 @@ The engine owns balances and the order book, applies each message to completion,
 **Phase 1: core backend**
 - [x] Actix server, signup/signin, JWT
 - [x] Protected `/balance`, message-driven USD worker, `/onramp`
+- [x] Message-driven stock balance worker, `/deposit/{asset_symbol}` wired up
+- [x] Password hashing with `bcrypt` (signup hash, signin verification)
+- [x] Unit tests with `cargo test`
 - [x] Integration tests with Bun + Axios
-- [ ] Register and fix `/deposit/{asset_symbol}`, with tests
 - [ ] Consistent error types and status codes
 
 **Phase 2: trading engine**
@@ -185,7 +188,8 @@ The engine owns balances and the order book, applies each message to completion,
 - [ ] Trade and transaction history; idempotent operations
 
 **Phase 4: production concerns**
-- [ ] Password hashing, env-based secrets, request validation
+- [x] Password hashing (bcrypt)
+- [ ] Env-based secrets, request validation
 - [ ] PostgreSQL for users, orders, and trades
 - [ ] Logging, load and failure-recovery tests, Docker, CI
 
@@ -195,22 +199,23 @@ The engine owns balances and the order book, applies each message to completion,
 
 | Concept | Where it shows up |
 | --- | --- |
-| Ownership and borrowing | Moving the `HashMap` into the worker thread so only it can touch it |
-| Enums and pattern matching | `BalanceMessage` and the worker's `match` loop |
-| `Mutex` and lock scope | Guards in `signup` and `deposit`; keep critical sections short and don't hold them across `.await` |
-| `mpsc` vs `oneshot` | Many handlers to one worker, and a private reply channel per request |
+| Ownership and borrowing | Moving balance maps into dedicated worker threads so only they can mutate them |
+| Enums and pattern matching | `BalanceMessage` / `StockBalanceMessage` and worker `match` loops |
+| Password security | Salting and hashing passwords via `bcrypt` to prevent plain text exposure |
+| `Mutex` and lock scope | Guards on `users` and `user_index`; keep critical sections short |
+| `mpsc` vs `oneshot` | Handlers send commands over `mpsc`, worker replies via per-request `oneshot` |
 | Extractors | `AuthUser` as declarative, per-handler authentication |
-| Trade-offs of actors vs locks | Both are present, and the split-brain problem in issue 4 motivates the single-engine design |
-| Integration testing | Testing through real HTTP instead of calling functions |
+| Integration testing | Testing through Actix test services and real HTTP |
 
 ---
 
 ## Running locally
 
-Requires Rust/Cargo, plus [Bun](https://bun.sh) for the tests.
+Requires Rust/Cargo, plus [Bun](https://bun.sh) for the integration tests.
 
 ```bash
 cd cex-rust
+cargo test                                  # runs internal unit tests (auth, etc.)
 cargo run                                   # serves on http://127.0.0.1:3001
 ```
 
@@ -227,6 +232,7 @@ Quick manual check:
 curl -X POST localhost:3001/signup -H 'Content-Type: application/json' -d '{"username":"amit","password":"123123"}'
 TOKEN=$(curl -s -X POST localhost:3001/signin -H 'Content-Type: application/json' -d '{"username":"amit","password":"123123"}' | jq -r .token)
 curl -X POST localhost:3001/onramp -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"qty":100}'
+curl -X POST localhost:3001/deposit/BTC -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"qty":5}'
 curl localhost:3001/balance -H "Authorization: Bearer $TOKEN"
 ```
 

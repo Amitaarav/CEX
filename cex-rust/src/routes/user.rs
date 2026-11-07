@@ -158,8 +158,8 @@ mod tests {
         let signup_req = test::TestRequest::post()
             .uri("/signup")
             .set_json(&SignupInput {
-                username: "alice".to_string(),
-                password: "supersecretpassword".to_string(),
+                username: "amit".to_string(),
+                password: "amitpassword".to_string(),
             })
             .to_request();
         let resp = test::call_service(&app, signup_req).await;
@@ -167,8 +167,8 @@ mod tests {
 
         // 2. Verify password is NOT stored in plain text and is a bcrypt hash
         let users = app_state.users.lock().unwrap();
-        let user = users.iter().find(|u| u.username == "alice").expect("user should exist");
-        assert_ne!(user.password, "supersecretpassword");
+        let user = users.iter().find(|u| u.username == "amit").expect("user should exist");
+        assert_ne!(user.password, "amitpassword");
         assert!(user.password.starts_with("$2b$") || user.password.starts_with("$2a$") || user.password.starts_with("$2y$"));
         drop(users);
 
@@ -176,8 +176,8 @@ mod tests {
         let signin_req = test::TestRequest::post()
             .uri("/signin")
             .set_json(&SigninInput {
-                username: "alice".to_string(),
-                password: "supersecretpassword".to_string(),
+                username: "amit".to_string(),
+                password: "amitpassword".to_string(),
             })
             .to_request();
         let signin_resp = test::call_service(&app, signin_req).await;
