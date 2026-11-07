@@ -1,11 +1,15 @@
-import express from "express"
-import { router as userRouter} from "./src/routes/user"
-const app = express()
+import express from "express";
+import { router as userRouter } from "./src/routes/user";
 
-app.use(express.json())
+export const app = express();
 
+app.use(express.json());
 app.use(userRouter);
 
-app.listen(3000, () => {
-    console.log("Server started running on port 3000")
-})
+const PORT = process.env.PORT || 3000;
+
+if (import.meta.main) {
+    app.listen(PORT, () => {
+        console.log(`Server started running on port ${PORT}`);
+    });
+}
