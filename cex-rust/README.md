@@ -14,9 +14,9 @@ This is a learning project. I'm building it in small, tested steps to understand
 | --- | --- | --- | --- |
 | `POST /signup` | none | Working | Duplicate usernames rejected |
 | `POST /signin` | none | Working | Returns a 24h JWT |
-| `GET /balance` | JWT | Working | USD from the balance worker, stocks from shared state |
+| `GET /balance` | JWT | Working | USD and stock balances from dedicated worker threads via mpsc + oneshot |
 | `POST /onramp` | JWT | Working | Fire-and-forget message to the balance worker |
-| `POST /deposit/...` | JWT | **Written, not wired up** | Handler exists but is not registered in `main.rs`; see [Known issues](#known-issues) |
+| `POST /deposit/{asset_symbol}` | JWT | Working | Fire-and-forget message to the stock balance worker |
 | `POST /order`, `POST /cancel` | JWT | Not started | Stubbed as comments; needs an order book |
 
 ---
@@ -29,8 +29,8 @@ This is a learning project. I'm building it in small, tested steps to understand
 | Actix Web 4 | HTTP server; requests are handled concurrently on a thread pool |
 | Serde / serde_json | Request and response (de)serialization; `camelCase` for API output |
 | jsonwebtoken + chrono | Signing JWTs and computing expiry |
-| `std::sync::Mutex` | Guarding shared in-memory state |
-| `std::sync::mpsc` + `futures::channel::oneshot` | Message passing to the balance worker and getting replies back |
+| `std::sync::Mutex` | Guarding shared user state (`users`, `user_index`) |
+| `std::sync::mpsc` + `futures::channel::oneshot` | Message passing to the USD and stock balance workers and getting replies back |
 | Bun + Axios | Integration tests against the running server over real HTTP |
 
 ---
@@ -40,18 +40,21 @@ This is a learning project. I'm building it in small, tested steps to understand
 ```mermaid
 flowchart TD
     Client["Client / Bun tests"] --> Actix["Actix Web handlers"]
-    Actix -->|"AuthUser extractor validates JWT"| Handlers["signup / signin / balance / onramp"]
-    Handlers -->|"Mutex"| State["AppState: users, user_index, stock_balances"]
-    Handlers -->|"mpsc: Onramp, GetBalance"| Worker["Balance worker thread"]
-    Worker --> USD["USD balances (owned by worker)"]
-    Worker -. "oneshot reply" .-> Handlers
+    Actix -->|"AuthUser extractor validates JWT"| Handlers["signup / signin / balance / onramp / deposit"]
+    Handlers -->|"Mutex"| State["AppState: users, user_index"]
+    Handlers -->|"mpsc: Onramp, GetBalance"| BalanceWorker["USD Balance worker thread"]
+    BalanceWorker --> USD["USD balances (owned by worker)"]
+    BalanceWorker -. "oneshot reply" .-> Handlers
+    Handlers -->|"mpsc: Deposit, GetStockBalance"| StockWorker["Stock Balance worker thread"]
+    StockWorker --> Stocks["Stock balances (owned by worker)"]
+    StockWorker -. "oneshot reply" .-> Handlers
 ```
 
 Code layout:
 
 ```
 src/
-  main.rs              AppState, BalanceMessage enum, worker thread, server setup
+  main.rs              AppState, BalanceMessage & StockBalanceMessage enums, worker threads, server setup
   middleware.rs        AuthUser extractor (JWT validation), AuthError
   routes/user.rs       signup, signin, balance, onramp, deposit handlers
   types/user.rs        User, request/response structs, JWT Claims
@@ -61,21 +64,28 @@ src/
 
 ## Engineering logic so far
 
-### 1. Two ways of owning state, on purpose
+### 1. Actor-style (message passing) for balances
 
-The project currently uses both common approaches to shared state, which makes the trade-off easy to see:
+Both USD and stock balances are owned by dedicated worker threads. Handlers cannot mutate the maps directly:
 
-- **Lock-based (`Mutex`)**: `users`, `user_index`, and `stock_balances` live in `AppState` behind mutexes. Any handler can lock and mutate them. Simple, but correctness depends on every caller locking correctly.
-- **Actor-style (message passing)**: USD balances are owned by a single worker thread. Handlers can't touch the map. They send a message (`Onramp` or `GetBalance`) and the worker applies it.
+- **USD Balances**: Handlers send `BalanceMessage` (`Onramp` or `GetBalance`).
+- **Stock Balances**: Handlers send `StockBalanceMessage` (`Deposit` or `GetStockBalance`).
 
 ```rust
-enum BalanceMessage {
+pub enum BalanceMessage {
     Onramp(u32, u32),                                  // user_id, amount
     GetBalance(u32, oneshot::Sender<u32>),             // user_id, reply channel
 }
+
+pub enum StockBalanceMessage {
+    Deposit(u32, String, u32),                         // user_id, symbol, amount
+    GetStockBalance(u32, oneshot::Sender<HashMap<String, u32>>), // user_id, reply channel
+}
 ```
 
-The worker processes messages one at a time, so there are no data races on the USD map. Updates are serialized without any lock around the balance logic.
+The workers process messages sequentially, eliminating data races on the balance maps without requiring locks around balance logic.
+
+- **Lock-based (`Mutex`)**: Reserved only for `users` and `user_index` in `AppState`.
 
 ### 2. Request/response over a one-way channel
 
