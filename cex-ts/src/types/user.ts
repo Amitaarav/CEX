@@ -34,3 +34,11 @@ export interface OnRampRequest {
 export interface DepositRequest {
     qty: number    
 }
+
+export interface OrderRequest {
+    // type: "market" | "limit", limit only as of now
+    side: "bid" | "ask",
+    qty: number,
+    price: number,
+    asset: "sol" | "eth"
+}

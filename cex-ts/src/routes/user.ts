@@ -1,6 +1,6 @@
 import { Router } from "express";
 import jwt from "jsonwebtoken"
-import type { SignupResponse, DepositRequest, OnRampRequest, User, Claims } from "../types/user";
+import type { SignupResponse, DepositRequest, OnRampRequest, User, Claims, OrderRequest } from "../types/user";
 import { authMiddleware, type AuthRequest, JWT_SECRET } from "../middleware";
 
 export const router = Router();
@@ -8,8 +8,9 @@ export const router = Router();
 let userIndex = 0;
 const users: User[] = [];
 
-const usdBalances: Map<number, number> = new Map();
-const stockBalances: Map<number, Map<String, number>> = new Map(); 
+const usdBalances: Map<number, {available: number, locked: number}> = new Map();
+const stockBalances: Map<number, Map<String, {available: number, locked: number}>> = new Map(); 
+
 /**
  * {
  * 1: {
@@ -38,7 +39,8 @@ router.post("/signup", (req, res) => {
         });
     }
 
-    usdBalances.set(userIndex, 0)
+    usdBalances.set(userIndex, {available: 0, locked: 0});
+    stockBalances.set(userIndex, new Map());
 
     res.json({
         message: "Successfully signup"
@@ -83,9 +85,11 @@ router.post("/onramp", authMiddleware, (req: AuthRequest, res) => {
     const userId = req.userId!;
     const body = req.body as OnRampRequest;
 
-    const currentBalance = usdBalances.get(userId) ?? 0;
+    usdBalances.set(userId, {
+        locked: usdBalances.get(userId)?.locked!,
+        available: usdBalances.get(userId)?.available! + body.qty
+    });
 
-    usdBalances.set(userId, currentBalance + body.qty);
     res.status(200).json({
         message: "Successfully onramp"
     })
@@ -97,7 +101,14 @@ router.post("/deposite/:asset_symbol", authMiddleware, (req: AuthRequest, res)=>
     const body = req.body as DepositRequest;
 
     const balances = stockBalances.get(userId)!;
-    const existingBalance = balances.get(symbol);
+    const existingBalance = balances.get(symbol);;
+
+    balances.set(
+        symbol,
+        {
+            locked: (existingBalance?.locked || 0), available: (existingBalance?.available || 0) + body.qty
+        }
+    )
 
     // balances.set(symbol, {
     //     locked: existingBalance?.locked || 0,
@@ -107,4 +118,35 @@ router.post("/deposite/:asset_symbol", authMiddleware, (req: AuthRequest, res)=>
     res.json({
         message: "Successfully deposited"
     })
+})
+
+router.post("/order", authMiddleware, (req: AuthRequest, res) => {
+    const userId = req.userId!;
+    const body = req.body as OrderRequest;
+
+    if(body.side == "bid"){
+        const amountToSpend = body.price * body.qty;
+        const userBalance = usdBalances.get(userId)?.available || 0;
+
+        if(userBalance < amountToSpend){
+            res.status(411).json({
+                message: "You have insufficient funds"
+            })
+            return;
+        }
+
+        // locking balances / stocks
+
+        // swap, orderbook or sit as locked
+    }
+
+    if(body.side == "ask"){
+        const existingAmount = stockBalances.get(userId)?.get(body.asset)?.available || 0;
+        if(body.qty > existingAmount){
+            res.status(411).json({
+                message: "You have insufficient stocks"
+            })
+            return;
+        }
+    }
 })
