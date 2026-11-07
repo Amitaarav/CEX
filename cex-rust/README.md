@@ -1,25 +1,11 @@
 # cex-rust — a centralized exchange backend, built to learn
 
-A centralized cryptocurrency exchange (CEX) backend in **Rust** and **Actix Web**. The exchange holds user funds, authenticates users, and (eventually) matches their buy and sell orders itself, unlike a DEX, where swaps settle on-chain.
+A centralized cryptocurrency exchange (CEX) backend in **Rust** and **Actix Web**. The exchange holds user funds, authenticates users, and matches their buy and sell orders itself, unlike a DEX, where swaps settle on-chain.
 
-This is a learning project. I'm building it in small, tested steps to understand how exchange backends handle identity, balances, concurrency, and eventually order matching. **It is not safe for real funds.** See [Known issues](#known-issues).
+This is a learning project. I'm building it in small, tested steps to understand how exchange backends handle identity, balances, concurrency, and order matching. **It is not safe for real funds.** See [Known issues](#known-issues).
 
 > A parallel TypeScript implementation lives in [`../cex-ts`](../cex-ts) so I can compare how the two runtimes handle the same problem.
 
----
-
-## Status at a glance
-
-| Endpoint | Auth | Status | Notes |
-| --- | --- | --- | --- |
-| `POST /signup` | none | Working | Password hashed with bcrypt; duplicate usernames rejected |
-| `POST /signin` | none | Working | Verified with bcrypt; returns a 24h JWT |
-| `GET /balance` | JWT | Working | USD and stock balances from dedicated worker threads via mpsc + oneshot |
-| `POST /onramp` | JWT | Working | Fire-and-forget message to the balance worker |
-| `POST /deposit/{asset_symbol}` | JWT | Working | Fire-and-forget message to the stock balance worker |
-| `POST /order`, `POST /cancel` | JWT | Not started | Stubbed as comments; needs an order book |
-
----
 
 ## Tech stack
 
@@ -32,6 +18,7 @@ This is a learning project. I'm building it in small, tested steps to understand
 | jsonwebtoken + chrono | Signing JWTs and computing expiry |
 | `std::sync::Mutex` | Guarding shared user state (`users`, `user_index`) |
 | `std::sync::mpsc` + `futures::channel::oneshot` | Message passing to the USD and stock balance workers and getting replies back |
+| `BTreeMap<u32, VecDeque<RestingOrder>>` | Orderbook storage — sorted price keys + FIFO queues for price-time priority (see [§6](#6-orderbook-matching-engine--data-structure-choices)) |
 | Cargo test + Bun / Axios | Unit tests via `cargo test` and integration tests against the running server |
 
 ---
@@ -49,16 +36,24 @@ flowchart TD
     Handlers -->|"mpsc: Deposit, GetStockBalance"| StockWorker["Stock Balance worker thread"]
     StockWorker --> Stocks["Stock balances (owned by worker)"]
     StockWorker -. "oneshot reply" .-> Handlers
+    Handlers -.->|"future: PlaceOrder, CancelOrder"| Orderbook["Orderbook engine (per asset)"]
+    Orderbook --> Bids["bids: BTreeMap + VecDeque"]
+    Orderbook --> Asks["asks: BTreeMap + VecDeque"]
 ```
 
 Code layout:
 
 ```
 src/
-  main.rs              AppState, BalanceMessage & StockBalanceMessage enums, worker threads, server setup
-  middleware.rs        AuthUser extractor (JWT validation), AuthError
-  routes/user.rs       signup, signin, balance, onramp, deposit handlers, tests
-  types/user.rs        User, request/response structs, JWT Claims
+  lib.rs               Shared crate root: module declarations, BalanceMessage, StockBalanceMessage, AppState
+  main.rs              Binary entry point: worker thread spawning, Actix server setup
+  middleware/mod.rs     AuthUser extractor (JWT validation), AuthError
+  routes/user.rs       signup, signin, balance, onramp, deposit handlers
+  types/user.rs        User, request/response structs (incl. OrderRequest, OrderResponse, CancelRequest, CancelResponse), JWT Claims
+  orderbook.rs         Orderbook matching engine: add_order, cancel_order, get_depth, get_snapshot
+tests/
+  auth_test.rs         bcrypt signup/signin integration test
+  orderbook_test.rs    13 orderbook matching engine tests
 ```
 
 ---
@@ -120,30 +115,80 @@ Two consequences I like:
 
 Balances and quantities are integers (`u32`), never floats, to avoid rounding errors. The plan is to move to a wider type and define explicit units (for example, cents for USD, smallest units for assets).
 
----
+### 6. Orderbook matching engine — data structure choices
 
-## Known issues
+The orderbook is the core of the exchange: it matches buy orders (bids) against sell orders (asks) using **price-time priority** — best price first, earliest order first within the same price.
 
-Found while reviewing the code, roughly in priority order.
+#### Why `BTreeMap<u32, VecDeque<RestingOrder>>` and not `HashMap`
 
-**Correctness**
+```rust
+pub struct Orderbook {
+    bids: BTreeMap<u32, VecDeque<RestingOrder>>,
+    asks: BTreeMap<u32, VecDeque<RestingOrder>>,
+}
+```
 
-1. **Overflow can kill the worker.** `amount + existing_amount` on `u32` panics in debug builds and wraps silently in release. If the worker thread panics, every later `GetBalance` fails and `rx.await.unwrap()` panics in the handler. Fix: `checked_add`, a wider type, and returning an error instead of unwrapping.
-2. **Onramp & deposit are fire-and-forget.** Handlers return `200` without confirmation, and send errors are ignored (`let _ =`). If the worker thread crashes, clients are told the operation succeeded.
-3. **Two balance actors vs. matching engine atomicity.** USD and stock balances live in separate worker threads. While lock-free and decoupled for isolated deposits, trade execution requires debiting one asset and crediting another atomically, which motivates unifying both under a single matching engine actor.
+**`BTreeMap` keeps price levels sorted automatically.** The keys are prices, and `BTreeMap` maintains them in ascending order. This means:
 
-**Security** (must be fixed before anything real)
+- **Asks** (sellers): `.iter()` yields lowest price first — exactly what a buyer wants to match against.
+- **Bids** (buyers): `.iter().rev()` yields highest price first — exactly what a seller wants to match against.
 
-4. The JWT secret is hardcoded in two places (`"secret"`), and the `JWT_SECRET` constant in `middleware.rs` is unused. Load one secret from the environment.
-5. The `Bearer ` prefix is optional (`trim_start_matches`), so a bare token is accepted.
+With a `HashMap`, you'd need to collect all keys and sort them on every incoming order, which is what the TypeScript version does:
+
+```typescript
+// TypeScript: must sort keys every time
+const askPrices = [...this.asks.keys()].sort((a, b) => parseFloat(a) - parseFloat(b));
+```
+
+`BTreeMap` gives O(log n) insert and lookup vs `HashMap`'s O(1), but for an orderbook that's a worthwhile trade — you get **free sorted iteration** and never pay for a sort pass on the hot path.
+
+#### Why `VecDeque` and not `Vec`
+
+Each price level holds a FIFO queue of orders. When an incoming order matches, it fills the **oldest resting order first** (time priority). This means we're always removing from the front:
+
+- `VecDeque::pop_front()` — **O(1)**, just moves the head pointer in the ring buffer.
+- `Vec::remove(0)` — **O(n)**, shifts every remaining element left.
+
+For an actively traded price level with many resting orders, this difference matters. New orders go to the back with `push_back()`, which is O(1) for both, so `VecDeque` wins on the operation that matters.
+
+#### Matching flow
+
+```mermaid
+flowchart LR
+    Order["Incoming bid at price P"] --> Check{"Ask exists at price ≤ P?"}
+    Check -->|Yes| Match["Fill against oldest ask at lowest price"]
+    Match --> Partial{"Fully filled?"}
+    Partial -->|"Resting order fully filled"| Pop["pop_front from VecDeque"]
+    Partial -->|"Resting order partially filled"| Update["Update filled_qty"]
+    Pop --> Check
+    Update --> Done["Incoming order fully consumed"]
+    Check -->|No| Rest["Remainder rests on bids BTreeMap"]
+```
+
+#### Tagged enum for match events
+
+```rust
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum MatchEvent {
+    Fill { buyer, seller, price, qty },
+    OrderbookUpdate { user_id, price, qty, order_id },
+}
+```
+
+`#[serde(tag = "type")]` produces clean JSON with a `"type": "fill"` or `"type": "orderbook_update"` discriminator, ready for WebSocket broadcasting later. Rust's tagged enum guarantees exhaustive `match` — the compiler forces handling of both variants.
+
+#### How cancel works
+
+`cancel_order(order_id)` does a linear scan of all price buckets on both sides. This is O(total orders) — acceptable for now, but a `HashMap<order_id, (side, price)>` index would make it O(log n). Added to the roadmap.
 
 **API quality**
 
-6. Status codes: duplicate signup returns `401` (should be `409`); a missing or invalid token returns `400` (should be `401`).
-7. `println!("Hi from middleware 1")` is leftover debug output.
-8. `users` is a `Vec` searched linearly. A `HashMap` keyed by username would be O(1).
-9. Asset symbols are case-sensitive (`BTC` and `btc` are different assets). Normalize them.
-10. Cargo.toml lists a crate named `web`, which looks like an accidental auto-import. Remove it unless intentional.
+7. Status codes: duplicate signup returns `401` (should be `409`); a missing or invalid token returns `400` (should be `401`).
+8. `println!("Hi from middleware 1")` is leftover debug output.
+9. `users` is a `Vec` searched linearly. A `HashMap` keyed by username would be O(1).
+10. Asset symbols are case-sensitive (`BTC` and `btc` are different assets). Normalize them.
+11. Cargo.toml lists a crate named `web`, which looks like an accidental auto-import. Remove it unless intentional.
 
 ---
 
@@ -163,37 +208,6 @@ enum EngineMessage {
 
 The engine owns balances and the order book, applies each message to completion, and replies over a `oneshot`. Handlers stay thin: validate, send, await. This also gives a deterministic ordering of events that is easy to test and later to persist or replay.
 
----
-
-## Roadmap
-
-**Phase 1: core backend**
-- [x] Actix server, signup/signin, JWT
-- [x] Protected `/balance`, message-driven USD worker, `/onramp`
-- [x] Message-driven stock balance worker, `/deposit/{asset_symbol}` wired up
-- [x] Password hashing with `bcrypt` (signup hash, signin verification)
-- [x] Unit tests with `cargo test`
-- [x] Integration tests with Bun + Axios
-- [ ] Consistent error types and status codes
-
-**Phase 2: trading engine**
-- [ ] Order types and `POST /order`, `POST /cancel`
-- [ ] In-memory order book with price-time priority (FIFO within a price level)
-- [ ] Matching, partial fills, balance updates after trades
-
-**Phase 3: financial correctness**
-- [ ] Reject overspending and negative balances
-- [ ] Lock funds when an order is placed and release them on cancel or fill
-- [ ] Merge USD and asset balances under the single engine
-- [ ] Trade and transaction history; idempotent operations
-
-**Phase 4: production concerns**
-- [x] Password hashing (bcrypt)
-- [ ] Env-based secrets, request validation
-- [ ] PostgreSQL for users, orders, and trades
-- [ ] Logging, load and failure-recovery tests, Docker, CI
-
----
 
 ## What I've learned so far
 
@@ -205,7 +219,10 @@ The engine owns balances and the order book, applies each message to completion,
 | `Mutex` and lock scope | Guards on `users` and `user_index`; keep critical sections short |
 | `mpsc` vs `oneshot` | Handlers send commands over `mpsc`, worker replies via per-request `oneshot` |
 | Extractors | `AuthUser` as declarative, per-handler authentication |
-| Integration testing | Testing through Actix test services and real HTTP |
+| `BTreeMap` vs `HashMap` | Sorted keys give free price-priority iteration without collect-and-sort on every order |
+| `VecDeque` for FIFO queues | O(1) `pop_front` for time-priority matching; `Vec` would be O(n) for front removal |
+| Tagged enums with serde | `#[serde(tag = "type")]` on `MatchEvent` for clean JSON discriminators |
+| Modular test layout | Integration tests in `tests/` directory, keeping source files focused on production code |
 
 ---
 
@@ -215,7 +232,7 @@ Requires Rust/Cargo, plus [Bun](https://bun.sh) for the integration tests.
 
 ```bash
 cd cex-rust
-cargo test                                  # runs internal unit tests (auth, etc.)
+cargo test                                  # 14 tests: auth + orderbook matching engine
 cargo run                                   # serves on http://127.0.0.1:3001
 ```
 

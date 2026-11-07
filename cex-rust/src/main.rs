@@ -1,38 +1,15 @@
-use std::{collections::HashMap, sync::{Mutex, mpsc::{self, Sender}}, thread::spawn};
+use std::{collections::HashMap, sync::{Mutex, mpsc}, thread::spawn};
 
-use actix_web::{App, HttpServer, web::{self}};
-
-use crate::{
-    BalanceMessage::{GetBalance, Onramp},
-    StockBalanceMessage::{Deposit, GetStockBalance},
+use actix_web::{App, HttpServer, web};
+use cex_rust::{
+    AppState,
+    BalanceMessage::{self, GetBalance, Onramp},
+    StockBalanceMessage::{self, Deposit, GetStockBalance},
     routes::user::{balance, deposit, onramp, sign_in, sign_up},
-    types::user::User,
 };
-
-pub mod types;
-pub mod routes;
-pub mod middleware;
-
-pub enum BalanceMessage {
-    Onramp(u32, u32),
-    GetBalance(u32, futures::channel::oneshot::Sender<u32>),
-}
-
-pub enum StockBalanceMessage {
-    Deposit(u32, String, u32), // user_id, asset_symbol, amount
-    GetStockBalance(u32, futures::channel::oneshot::Sender<HashMap<String, u32>>),
-}
-
-pub struct AppState {
-    pub user_index: Mutex<u32>,
-    pub users: Mutex<Vec<User>>,
-    pub balances_tx: Sender<BalanceMessage>,
-    pub stock_balances_tx: Sender<StockBalanceMessage>,
-}
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-
     let (tx, rx) = mpsc::channel(); // mpsc: multiple producers, single consumer
     let (stock_tx, stock_rx) = mpsc::channel();
 
