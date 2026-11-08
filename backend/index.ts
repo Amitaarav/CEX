@@ -4,6 +4,10 @@ import express from "express";
 import { CreateUserSchema } from "./src/types/user";
 import { pgPool } from "./src/config/postgres";
 import { redisClient } from "./src/config/redis";
+import bcrypt from "bcrypt";
+import jwt from "jsonwebtoken";
+
+import { authMiddleware } from "./middlewares/authMiddleware";
 
 const port = Number(process.env.PORT) || 3000;
 const app = express();
@@ -23,19 +27,66 @@ async function connectionServices() {
     }
 }
 
-app.post("/signup", (req, res) => {
+app.post("/signup", async (req, res) => {
     const { data, success } = CreateUserSchema.safeParse(req.body);
+
     if (!success) {
         return res.status(411).json({ error: "Invalid input" });
     }
 
+    const existingUser =  await pgPool.query(`SELECT * FROM users WHERE username=$`, [data.username])
+    if(!existingUser){
+        res.status(411).json({error: "User already exists"})
+    }
+
+    const hashedPassword = bcrypt.hash(data.password, 10)
+
+    const newUser = await pgPool.query('INSERT INTO users (username, hashedPassword) VALUES ($, $) RETURNING id;', [data.username, hashedPassword]);
+
+    res.json({
+        id: newUser.rows[0].id,
+        message: "User created successfully"
+    })
 })
 
-app.post("/signin", (req, res) => {
+app.post("/signin",async (req, res) => {
+    const { data, success } = req.body;
 
+    if(!success){
+        return res.status(411).json({
+            error: "Invalid inputs"
+        })
+    }
+
+    const existingUser = await pgPool.query(`SELECT * FROM users WHERE username=$`, [data.username]);
+
+    if(existingUser.rowCount !== 0){
+        return res.status(411).json({
+            error: "User already exists"
+        })
+    }
+
+    if(existingUser.rows[0].hashedPassword != data.password){
+        return res.status(403).json({
+            message: "Password incorrect"
+        })
+    }
+
+    const token = jwt.sign({
+            id: existingUser.rows[0].id
+        },
+            process.env.JWT_SECRET as string,
+        {
+            expiresIn: "1h"
+        }
+    );
+
+    res.json({
+        token: token
+    })
 })
 
-app.post("/signup", (req, res) => {
+app.post("/onramp", authMiddleware, (req, res) => {
 
 })
 
