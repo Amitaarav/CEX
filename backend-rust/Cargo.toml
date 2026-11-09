@@ -1,0 +1,9 @@
+[package]
+name = "backend-rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+actix-web = "4"
+dotenvy = "0.15"
+serde = { version = "1", features = ["derive"] }
