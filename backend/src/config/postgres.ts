@@ -35,6 +35,15 @@ const poolConfig: PoolConfig = {
 };
 
 export const pgPool = new Pool(poolConfig);
+// Make pool.end() idempotent so multiple test suites / shutdown handlers don't throw "Called end on pool more than once"
+const originalEnd = pgPool.end.bind(pgPool);
+pgPool.end = (async (cb?: (err?: Error) => void): Promise<void> => {
+    if (pgPool.ending || pgPool.ended) {
+        if (cb) cb();
+        return;
+    }
+    return originalEnd(cb as any);
+}) as any;
 
 pgPool.on("error", (err) => {
     console.error("Unexpected PostgreSQL error: ", err);
